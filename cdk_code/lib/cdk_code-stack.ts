@@ -1,5 +1,12 @@
-import { Stack, StackProps, RemovalPolicy } from 'aws-cdk-lib';
+import {Duration, Stack, StackProps, RemovalPolicy, CfnOutput } from 'aws-cdk-lib';
 import * as s3 from "aws-cdk-lib/aws-s3";
+import * as glue from "aws-cdk-lib/aws-glue";
+import * as targets from "aws-cdk-lib/aws-events-targets";
+import * as sfn from "aws-cdk-lib/aws-stepfunctions";
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as subs from 'aws-cdk-lib/aws-sns-subscriptions';
+import * as tasks from "aws-cdk-lib/aws-stepfunctions-tasks";
+import * as events from "aws-cdk-lib/aws-events";
 import * as api_gw from "aws-cdk-lib/aws-apigateway";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
@@ -25,7 +32,7 @@ export class CdkCodeStack extends Stack {
 
     // Bucket donde se almacenarán los archivos 
     const dataBucket = new s3.Bucket(this, "ingestion-bucket-id", {
-      bucketName: 'ingestion-bkcuet-for-test-jg',
+      bucketName: 'ingestion-bucket-for-test-jg',
       eventBridgeEnabled: true,
       autoDeleteObjects: true,
       removalPolicy: RemovalPolicy.DESTROY
@@ -123,5 +130,138 @@ export class CdkCodeStack extends Stack {
     
   }
   );
+
+
+    // Creamos un rol para asignarlo a los jobs
+    const executeGlueJobsRole = new iam.Role(this, "glue-job-role-id", {
+      assumedBy: new iam.ServicePrincipal("glue.amazonaws.com"),
+      roleName: "Glue-Jobs-Role",
+      description: "Rol de IAM para que los Glue Jobs puedan leer y escribir en los buckets de S3 asi como guardar logs.",
+    });
+
+    // Añademos un Policy al rol de IAM
+    executeGlueJobsRole.addToPolicy(
+        new iam.PolicyStatement({
+            resources: [assetsBucket.bucketArn + "/*",dataBucket.bucketArn + "/*"],
+            actions: ["s3:*",
+                    "s3-object-lambda:*"],
+        })
+    );
+
+    // Cargamos una Managed Policy
+    const managedPolicy = iam.ManagedPolicy.fromAwsManagedPolicyName(
+        'CloudWatchFullAccess',
+    );
+    const managedPolicy_2 = iam.ManagedPolicy.fromAwsManagedPolicyName(
+      'service-role/AWSGlueServiceRole', // from the arn after policy
+    );
+    const managedPolicy_3 = iam.ManagedPolicy.fromAwsManagedPolicyName(
+      'SecretsManagerReadWrite', // from the arn after policy
+    );
+    // Asignamos la política al rol
+    executeGlueJobsRole.addManagedPolicy(managedPolicy);
+    executeGlueJobsRole.addManagedPolicy(managedPolicy_2);
+    executeGlueJobsRole.addManagedPolicy(managedPolicy_3);
+
+
+    // Job de validación
+    const loadjob = new glue.CfnJob(this, 'load-data-job-id', {
+        command: {
+          name: 'glueetl',
+          pythonVersion: '3',
+          scriptLocation: "s3://" + assetsBucket.bucketName + "/assets/transformation/load-job.py",
+        },
+        defaultArguments: {
+          "--BUCKET_NAME": dataBucket.bucketName,
+        },
+        role: executeGlueJobsRole.roleArn,
+        description: 'Este job se encarga de cargar el archivo a la base de datos RDS.',
+        executionProperty: {
+          maxConcurrentRuns: 3,
+        },
+        maxCapacity: 2,
+        maxRetries: 0,
+        name: 'load-data-job',
+        timeout: 5,
+        glueVersion: "3.0",
+      });
+
+      
+      const glue_1_task = new tasks.GlueStartJobRun(this, "sf-load-data-job", {
+        glueJobName: "load-data-job",
+        arguments: sfn.TaskInput.fromObject({
+            "--KEY.$": "$.detail.object.key",
+        }),
+        outputPath: "$",
+        inputPath: "$",
+        resultPath: "$",
+        integrationPattern: sfn.IntegrationPattern.RUN_JOB, //runJob.sync
+    })
+
+
+      const topic = new sns.Topic(this, 'sns-topic', {
+        displayName: 'Topico de notificacion de funcionalidad de ingesta de datos.',
+      });
+      topic.addSubscription(new subs.EmailSubscription("jurgen.guerra@unmsm.edu.pe"));
+  
+        
+      const jobFailedTask = new tasks.SnsPublish(this, 'publish-notification', {
+        topic: topic,
+        message: sfn.TaskInput.fromJsonPathAt('$.error'),
+        resultPath: '$.error',
+        subject: "Failed Execution",
+      });
+  
+      const stepFunctionDefinition = glue_1_task
+        .addCatch(jobFailedTask,{   
+            resultPath: '$.error',
+        }
+      )
+
+      const SFMachine = new sfn.StateMachine(this, "state-machine-id", {
+        stateMachineName: "ingestion-pipeline",
+        definitionBody: sfn.DefinitionBody.fromChainable(stepFunctionDefinition),
+        timeout: Duration.minutes(10),
+    });
+      
+    // Regla de eventbridge para ejecutar el SM
+    const eventRule = new events.Rule(this, "s3-object-created", {
+      ruleName: "s3-object-created",
+      eventPattern: {
+          source: ["aws.s3"],
+          detailType: ["Object Created"],
+          detail: {
+              bucket: {
+                  name: [dataBucket.bucketName]
+              },
+              object: {
+                  key: [{
+                      prefix: "ingestion"
+                  }]
+              }
+          }
+      }
+  });
+
+  // Creamos un rol para ejecutar el step function 
+  const invokeStepFunctionRole = new iam.Role(this, "invoke-step-function-role-id", {
+      assumedBy: new iam.ServicePrincipal("events.amazonaws.com"),
+      roleName: "Invoke-Step-Function-Role",
+      description: "Rol de IAM para invocar el Step Function.",
+  });
+
+  // Añademos un Policy al rol de IAM
+  invokeStepFunctionRole.addToPolicy(
+      new iam.PolicyStatement({
+          resources: [SFMachine.stateMachineArn],
+          actions: ["states:StartExecution"],
+      })
+  );
+
+  // Añadimos un target a la regla del evento
+  eventRule.addTarget(new targets.SfnStateMachine(SFMachine, {
+      role: invokeStepFunctionRole
+    }));
+
   }
 }
