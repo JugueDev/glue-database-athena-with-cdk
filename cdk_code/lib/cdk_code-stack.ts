@@ -11,14 +11,17 @@ import * as api_gw from "aws-cdk-lib/aws-apigateway";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import { Construct } from 'constructs';
+import { glueTableColumns } from "./table-schema";
 
 export class CdkCodeStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
+
+    const prefix =  "prueba-database"
     
     // Bucket donde se almacenarán los archivos 
     const assetsBucket = new s3.Bucket(this, "assets-bucket-id", {
-      bucketName: "assets-bucket-for-test-jg",
+      bucketName: prefix + "-assets-bucket-for-test-jg",
       autoDeleteObjects: true,
       removalPolicy: RemovalPolicy.DESTROY
   });
@@ -32,7 +35,7 @@ export class CdkCodeStack extends Stack {
 
     // Bucket donde se almacenarán los archivos 
     const dataBucket = new s3.Bucket(this, "ingestion-bucket-id", {
-      bucketName: 'ingestion-bucket-for-test-jg',
+      bucketName: prefix + '-ingestion-bucket-for-test-jg',
       eventBridgeEnabled: true,
       autoDeleteObjects: true,
       removalPolicy: RemovalPolicy.DESTROY
@@ -41,7 +44,7 @@ export class CdkCodeStack extends Stack {
   // Rol de IAM a asignar al Api Gateway
   const apiGWRole = new iam.Role(this, "api-gateway-role-id", {
     assumedBy: new iam.ServicePrincipal("apigateway.amazonaws.com"),
-    roleName: "API-Gateway-S3-Integration-Role",
+    roleName: prefix + "-API-Gateway-S3-Integration-Role",
     description: "Rol de IAM para que un AP GW pueda guardar archivos en S3",
   });
 
@@ -55,7 +58,7 @@ export class CdkCodeStack extends Stack {
 
   // API Gateway para ingestar los archivos
   const apiGateway = new api_gw.RestApi(this, "data-api-id", {
-      restApiName: "Files receiver",
+      restApiName: prefix + "-Files receiver",
       description: "Recibe archivos para poder almacenarlos en S3.",
       binaryMediaTypes: ["*/*"],
       endpointTypes: [api_gw.EndpointType.REGIONAL],
@@ -66,7 +69,7 @@ export class CdkCodeStack extends Stack {
 
     // Añadimos un usage plan para la API
   const basicUsagePlan = apiGateway.addUsagePlan('UsagePlan', {
-    name: "MyUsagePlan",
+    name: prefix + "-MyUsagePlan",
     apiStages: [{
       api: apiGateway,
       stage: apiGateway.deploymentStage
@@ -135,7 +138,7 @@ export class CdkCodeStack extends Stack {
     // Creamos un rol para asignarlo a los jobs
     const executeGlueJobsRole = new iam.Role(this, "glue-job-role-id", {
       assumedBy: new iam.ServicePrincipal("glue.amazonaws.com"),
-      roleName: "Glue-Jobs-Role",
+      roleName: prefix + "-Glue-Jobs-Role",
       description: "Rol de IAM para que los Glue Jobs puedan leer y escribir en los buckets de S3 asi como guardar logs.",
     });
 
@@ -181,14 +184,14 @@ export class CdkCodeStack extends Stack {
         },
         maxCapacity: 2,
         maxRetries: 0,
-        name: 'load-data-job',
+        name: prefix + '-load-data-job',
         timeout: 5,
         glueVersion: "3.0",
       });
 
       
       const glue_1_task = new tasks.GlueStartJobRun(this, "sf-load-data-job", {
-        glueJobName: "load-data-job",
+        glueJobName: prefix + "-load-data-job",
         arguments: sfn.TaskInput.fromObject({
             "--KEY.$": "$.detail.object.key",
         }),
@@ -219,14 +222,14 @@ export class CdkCodeStack extends Stack {
       )
 
       const SFMachine = new sfn.StateMachine(this, "state-machine-id", {
-        stateMachineName: "ingestion-pipeline",
+        stateMachineName: prefix + "-ingestion-pipeline",
         definitionBody: sfn.DefinitionBody.fromChainable(stepFunctionDefinition),
         timeout: Duration.minutes(10),
     });
       
     // Regla de eventbridge para ejecutar el SM
     const eventRule = new events.Rule(this, "s3-object-created", {
-      ruleName: "s3-object-created",
+      ruleName: prefix + "-s3-object-created",
       eventPattern: {
           source: ["aws.s3"],
           detailType: ["Object Created"],
@@ -246,7 +249,7 @@ export class CdkCodeStack extends Stack {
   // Creamos un rol para ejecutar el step function 
   const invokeStepFunctionRole = new iam.Role(this, "invoke-step-function-role-id", {
       assumedBy: new iam.ServicePrincipal("events.amazonaws.com"),
-      roleName: "Invoke-Step-Function-Role",
+      roleName: prefix + "-Invoke-Step-Function-Role",
       description: "Rol de IAM para invocar el Step Function.",
   });
 
@@ -262,6 +265,34 @@ export class CdkCodeStack extends Stack {
   eventRule.addTarget(new targets.SfnStateMachine(SFMachine, {
       role: invokeStepFunctionRole
     }));
+
+      const glueDatabase = new glue.CfnDatabase(this, 'CfnDatabase', {
+        catalogId: Stack.of(this).account,
+        databaseInput: {
+          description: 'Database Test',
+          name: prefix + '-glue-database-test',
+        },
+      });
+      const glueTable = new glue.CfnTable(this, 'CfnTable', {  
+        catalogId: glueDatabase.catalogId,
+        databaseName: prefix + '-glue-database-test',
+        tableInput: {
+          description: 'Tabla de datos.',
+          name: prefix + '-glue-database-test',
+          storageDescriptor: {
+            columns: glueTableColumns,
+            location: "s3://" + dataBucket.bucketName + "/database/",
+            inputFormat: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+            outputFormat: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+            serdeInfo:  {
+              serializationLibrary: 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe',
+            },
+          },
+          tableType: "EXTERNAL_TABLE",
+        },
+      });
+    
+    glueTable.node.addDependency(glueDatabase);
 
   }
 }

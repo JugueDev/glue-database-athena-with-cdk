@@ -34,7 +34,7 @@ if df.count() == 0:
 
 df.printSchema()
 
-path_output = "s3://"+BUCKET_NAME+"/database/" + file 
+path_output = "s3://"+BUCKET_NAME+"/database/" 
 df.write.mode("overwrite")\
     .option("header", "true")\
     .parquet(path_output)
